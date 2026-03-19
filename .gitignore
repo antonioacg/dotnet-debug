@@ -1,0 +1,4 @@
+dotnet-debug
+dotnet-debug.exe
+.netcoredbg_hist
+dist/
