@@ -2,21 +2,34 @@
 
 Autonomous .NET debugger CLI for AI agents. Manages debug sessions via a background daemon that speaks DAP to netcoredbg.
 
-## Build
+## Build & Install
 
 ```bash
-go build -o dotnet-debug .
+go install .                        # installs to ~/go/bin/dotnet-debug
+dotnet-debug install-netcoredbg     # downloads netcoredbg for your platform
 ```
 
-## Setup
+## Setup for other projects
 
-netcoredbg must be installed. On macOS arm64, the Samsung build doesn't work — use the Cliffback pre-built:
+The tool ships a Claude Code skill for autonomous debugging. Install it where you need it:
 
 ```bash
-./scripts/install-netcoredbg.sh
+# User-level (available in all projects)
+dotnet-debug install-skill --user
+
+# Project-level (available only in that project)
+dotnet-debug install-skill --project /path/to/my-dotnet-app
 ```
 
-Or set `NETCOREDBG_PATH` to point to a working netcoredbg binary.
+Then in any Claude Code session: `/debug-dotnet "the /orders endpoint returns 500"`
+
+### PATH prerequisite
+
+`~/go/bin` must be in PATH. This is managed via chezmoi in `dot_zprofile.tmpl`:
+
+```bash
+export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"
+```
 
 ## Architecture
 
