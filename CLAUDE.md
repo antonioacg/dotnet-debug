@@ -21,7 +21,7 @@ dotnet-debug install-skill --user
 dotnet-debug install-skill --project /path/to/my-dotnet-app
 ```
 
-Then in any Claude Code session: `/debug-dotnet "the /orders endpoint returns 500"`
+Then in any Claude Code session: `/dotnet-debug "the /orders endpoint returns 500"`
 
 ### PATH prerequisite
 

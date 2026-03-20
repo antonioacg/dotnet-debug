@@ -77,7 +77,7 @@ dotnet-debug install-skill --user
 dotnet-debug install-skill --project /path/to/my-dotnet-app
 
 # Then in Claude Code:
-# /debug-dotnet "the /orders endpoint returns 500"
+# /dotnet-debug "the /orders endpoint returns 500"
 ```
 
 ## Architecture

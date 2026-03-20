@@ -23,7 +23,7 @@ import (
 // version is set at build time via ldflags.
 var version = "dev"
 
-//go:embed skills/debug-dotnet/SKILL.md
+//go:embed skills/dotnet-debug/SKILL.md
 var skillContent []byte
 
 func main() {
@@ -466,20 +466,20 @@ func cmdInstallSkill(args []string) {
 		if err != nil {
 			fatal("finding home directory: %v", err)
 		}
-		targetDir = filepath.Join(home, ".claude", "skills", "debug-dotnet")
+		targetDir = filepath.Join(home, ".claude", "skills", "dotnet-debug")
 	case *project != "":
 		absProject, err := filepath.Abs(*project)
 		if err != nil {
 			fatal("resolving project path: %v", err)
 		}
-		targetDir = filepath.Join(absProject, ".claude", "skills", "debug-dotnet")
+		targetDir = filepath.Join(absProject, ".claude", "skills", "dotnet-debug")
 	default:
 		// Default: current directory (project-level)
 		cwd, err := os.Getwd()
 		if err != nil {
 			fatal("getting working directory: %v", err)
 		}
-		targetDir = filepath.Join(cwd, ".claude", "skills", "debug-dotnet")
+		targetDir = filepath.Join(cwd, ".claude", "skills", "dotnet-debug")
 	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -493,7 +493,7 @@ func cmdInstallSkill(args []string) {
 
 	printResult(proto.Result{OK: true, Data: map[string]interface{}{
 		"installed": skillPath,
-		"invoke":    "/debug-dotnet <problem description>",
+		"invoke":    "/dotnet-debug <problem description>",
 	}})
 }
 
