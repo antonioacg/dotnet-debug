@@ -27,9 +27,11 @@ const inactivityTimeout = 2 * time.Hour
 type Daemon struct {
 	config  proto.DaemonConfig
 	session *dap.Session
-	cmd     *exec.Cmd
+	cmd     *exec.Cmd // netcoredbg process
 	token   string
 	port    int
+
+	dotnetRunCmd *exec.Cmd // dotnet run process (project mode only)
 
 	mu       sync.Mutex
 	state    string // "running", "stopped", "exited"
@@ -126,18 +128,31 @@ func (d *Daemon) start() error {
 		if err := d.session.Attach(dap.AttachArguments{ProcessID: d.config.PID}); err != nil {
 			return fmt.Errorf("DAP attach: %w", err)
 		}
+	case "project":
+		pid, err := d.launchDotnetRun()
+		if err != nil {
+			return fmt.Errorf("dotnet run: %w", err)
+		}
+		d.config.PID = pid
+		if err := d.session.Attach(dap.AttachArguments{ProcessID: pid}); err != nil {
+			return fmt.Errorf("DAP attach after dotnet run: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown mode: %s", d.config.Mode)
 	}
 
 	// Write session file
 	d.lastActivity = time.Now()
+	program := d.config.Program
+	if program == "" {
+		program = d.config.Project
+	}
 	sf := proto.SessionFile{
 		ID:           d.config.SessionID,
 		Port:         d.port,
 		DaemonPID:    os.Getpid(),
 		Token:        d.token,
-		Program:      d.config.Program,
+		Program:      program,
 		AttachedPID:  d.config.PID,
 		Created:      d.lastActivity.Format(time.RFC3339),
 		LastActivity: d.lastActivity.Format(time.RFC3339),
@@ -186,6 +201,85 @@ func (d *Daemon) startNetcoredbg() error {
 	return nil
 }
 
+// launchDotnetRun starts `dotnet run` for project mode and returns the child
+// .NET process PID. The caller is responsible for attaching the debugger.
+func (d *Daemon) launchDotnetRun() (int, error) {
+	args := []string{"run", "--project", d.config.Project, "--no-build"}
+	if d.config.LaunchProfile != "" {
+		args = append(args, "--launch-profile", d.config.LaunchProfile)
+	}
+	if len(d.config.Args) > 0 {
+		args = append(args, "--")
+		args = append(args, d.config.Args...)
+	}
+
+	cmd := exec.Command("dotnet", args...)
+	cwd := d.config.Cwd
+	if cwd == "" {
+		cwd = filepath.Dir(d.config.Project)
+	}
+	cmd.Dir = cwd
+
+	// Pass environment variables (merge with current env)
+	if len(d.config.Env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range d.config.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("creating stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return 0, fmt.Errorf("creating stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("starting dotnet run: %w", err)
+	}
+	d.dotnetRunCmd = cmd
+	log.Printf("daemon: dotnet run started (PID %d)", cmd.Process.Pid)
+
+	// Pipe stdout/stderr to the output ring buffer
+	go d.pipeOutput(stdout)
+	go d.pipeOutput(stderr)
+
+	// Monitor process exit
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("daemon: dotnet run exited: %v", err)
+		} else {
+			log.Printf("daemon: dotnet run exited normally")
+		}
+	}()
+
+	// Find the child .NET process
+	pid, err := findChildPID(cmd.Process.Pid, 15*time.Second)
+	if err != nil {
+		cmd.Process.Kill()
+		return 0, err
+	}
+	log.Printf("daemon: found child .NET process PID %d", pid)
+	return pid, nil
+}
+
+// pipeOutput reads lines from r and appends them to the output ring buffer.
+func (d *Daemon) pipeOutput(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		d.outputMu.Lock()
+		d.output = append(d.output, line)
+		if len(d.output) > 10000 {
+			d.output = d.output[len(d.output)-8000:]
+		}
+		d.outputMu.Unlock()
+	}
+}
+
 func (d *Daemon) monitorEvents() {
 	for {
 		select {
@@ -220,8 +314,8 @@ func (d *Daemon) monitorEvents() {
 			if body.Category == "stdout" || body.Category == "console" || body.Category == "" {
 				d.outputMu.Lock()
 				d.output = append(d.output, body.Output)
-				if len(d.output) > 1000 {
-					d.output = d.output[len(d.output)-500:]
+				if len(d.output) > 10000 {
+					d.output = d.output[len(d.output)-8000:]
 				}
 				d.outputMu.Unlock()
 			}
@@ -486,7 +580,7 @@ func (d *Daemon) cmdPause(raw json.RawMessage) proto.Result {
 		json.Unmarshal(raw, &args)
 	}
 	if err := d.session.Pause(args.ThreadID); err != nil {
-		return proto.Result{Error: err.Error()}
+		return proto.Result{Error: enhanceError(err.Error())}
 	}
 	return proto.Result{OK: true, Data: "paused"}
 }
@@ -669,7 +763,7 @@ func (d *Daemon) cmdEval(raw json.RawMessage) proto.Result {
 
 	resp, err := d.session.Evaluate(args.Expression, args.FrameID, "repl")
 	if err != nil {
-		return proto.Result{Error: err.Error()}
+		return proto.Result{Error: enhanceError(err.Error())}
 	}
 
 	return proto.Result{OK: true, Data: map[string]interface{}{
@@ -770,7 +864,7 @@ func (d *Daemon) cmdOutput(raw json.RawMessage) proto.Result {
 
 	lines := args.Lines
 	if lines == 0 {
-		lines = 50
+		lines = 100
 	}
 
 	d.outputMu.Lock()
@@ -829,6 +923,9 @@ func (d *Daemon) cleanup() {
 	}
 	if d.cmd != nil && d.cmd.Process != nil {
 		d.cmd.Process.Kill()
+	}
+	if d.dotnetRunCmd != nil && d.dotnetRunCmd.Process != nil {
+		d.dotnetRunCmd.Process.Kill()
 	}
 	// Remove session file
 	os.Remove(paths.SessionFile(d.config.SessionID))

@@ -156,7 +156,7 @@ type SessionFile struct {
 // --- Daemon startup config (passed as CLI arg to __daemon__) ---
 
 type DaemonConfig struct {
-	Mode           string            `json:"mode"` // "launch" or "attach"
+	Mode           string            `json:"mode"` // "launch", "attach", or "project"
 	SessionID      string            `json:"sessionId"`
 	NetcoredbgPath string            `json:"netcoredbgPath"`
 	Program        string            `json:"program,omitempty"`
@@ -164,5 +164,7 @@ type DaemonConfig struct {
 	Cwd            string            `json:"cwd,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	StopAtEntry    bool              `json:"stopAtEntry,omitempty"`
-	PID            int               `json:"pid,omitempty"` // for attach mode
+	PID            int               `json:"pid,omitempty"`           // for attach mode
+	Project        string            `json:"project,omitempty"`       // for project mode: .csproj path
+	LaunchProfile  string            `json:"launchProfile,omitempty"` // for project mode: launch profile name
 }

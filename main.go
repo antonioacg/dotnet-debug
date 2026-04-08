@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,19 @@ import (
 
 // version is set at build time via ldflags.
 var version = "dev"
+
+// envMapFlag implements flag.Value for repeatable --env KEY=VALUE flags.
+type envMapFlag map[string]string
+
+func (e *envMapFlag) String() string { return "" }
+func (e *envMapFlag) Set(val string) error {
+	parts := strings.SplitN(val, "=", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return fmt.Errorf("invalid env format %q, expected KEY=VALUE", val)
+	}
+	(*e)[parts[0]] = parts[1]
+	return nil
+}
 
 //go:embed skills/dotnet-debug/SKILL.md
 var skillContent []byte
@@ -99,36 +113,64 @@ func main() {
 
 func cmdLaunch(args []string) {
 	fs := flag.NewFlagSet("launch", flag.ExitOnError)
-	dll := fs.String("dll", "", "path to DLL (required)")
+	dll := fs.String("dll", "", "path to DLL")
+	project := fs.String("project", "", "path to .csproj (alternative to --dll)")
+	launchProfile := fs.String("launch-profile", "", "launch profile name (with --project)")
 	cwd := fs.String("cwd", "", "working directory")
 	progArgs := fs.String("args", "", "program arguments (space-separated)")
 	session := fs.String("session", "", "session ID (auto-generated if omitted)")
 	stopAtEntry := fs.Bool("stop-at-entry", false, "stop at entry point")
 	netcoredbg := fs.String("netcoredbg", "", "path to netcoredbg binary")
+	envVars := make(envMapFlag)
+	fs.Var(&envVars, "env", "environment variable KEY=VALUE (repeatable)")
+	force := fs.Bool("force", false, "skip port conflict check")
 	fs.Parse(args)
 
-	if *dll == "" {
-		fatal("--dll is required")
+	if *dll == "" && *project == "" {
+		fatal("either --dll or --project is required")
 	}
-
-	// Resolve DLL to absolute path
-	absPath, err := filepath.Abs(*dll)
-	if err != nil {
-		fatal("resolving DLL path: %v", err)
+	if *dll != "" && *project != "" {
+		fatal("--dll and --project are mutually exclusive")
 	}
-	if _, err := os.Stat(absPath); err != nil {
-		fatal("DLL not found: %s", absPath)
+	if *project != "" && *stopAtEntry {
+		fatal("--stop-at-entry is not compatible with --project mode (debugger attaches after app starts)")
 	}
 
 	if err := paths.EnsureDirs(); err != nil {
 		fatal("creating directories: %v", err)
 	}
 
-	if *session == "" {
-		*session = paths.GenerateSessionID(absPath)
+	// Resolve target path (DLL or csproj)
+	var targetPath string
+	if *dll != "" {
+		absPath, err := filepath.Abs(*dll)
+		if err != nil {
+			fatal("resolving DLL path: %v", err)
+		}
+		if _, err := os.Stat(absPath); err != nil {
+			fatal("DLL not found: %s", absPath)
+		}
+		targetPath = absPath
+	} else {
+		absPath, err := filepath.Abs(*project)
+		if err != nil {
+			fatal("resolving project path: %v", err)
+		}
+		if _, err := os.Stat(absPath); err != nil {
+			fatal("project file not found: %s", absPath)
+		}
+		targetPath = absPath
 	}
-	if _, err := loadSession(*session); err == nil {
-		fatal("session %q already exists. Use 'stop --session %s' first or choose a different name.", *session, *session)
+
+	if *session == "" {
+		*session = paths.GenerateSessionID(targetPath)
+	}
+	if sf, err := loadSession(*session); err == nil {
+		if isProcessAlive(sf.DaemonPID) {
+			fatal("session %q already exists and is running (PID %d). Use 'stop --session %s' first.", *session, sf.DaemonPID, *session)
+		}
+		os.Remove(paths.SessionFile(*session))
+		log.Printf("cleaned up stale session %q (PID %d no longer running)", *session, sf.DaemonPID)
 	}
 
 	dbgPath := *netcoredbg
@@ -144,21 +186,55 @@ func cmdLaunch(args []string) {
 		pArgs = strings.Fields(*progArgs)
 	}
 
-	config := proto.DaemonConfig{
-		Mode:           "launch",
-		SessionID:      *session,
-		NetcoredbgPath: dbgPath,
-		Program:        absPath,
-		Args:           pArgs,
-		Cwd:            *cwd,
-		StopAtEntry:    *stopAtEntry,
+	// Check for port conflicts before launching
+	if !*force {
+		urls := envVars["ASPNETCORE_URLS"]
+		if urls == "" {
+			urls = os.Getenv("ASPNETCORE_URLS")
+		}
+		if urls != "" {
+			for _, port := range parsePortsFromURLs(urls) {
+				if available, pid := checkPortAvailable(port); !available {
+					msg := fmt.Sprintf("port %d already in use", port)
+					if pid > 0 {
+						msg += fmt.Sprintf(" by PID %d", pid)
+					}
+					msg += ". Kill the existing process or use --force to skip this check."
+					fatal(msg)
+				}
+			}
+		}
+	}
+
+	var config proto.DaemonConfig
+	if *dll != "" {
+		config = proto.DaemonConfig{
+			Mode:           "launch",
+			SessionID:      *session,
+			NetcoredbgPath: dbgPath,
+			Program:        targetPath,
+			Args:           pArgs,
+			Cwd:            *cwd,
+			Env:            map[string]string(envVars),
+			StopAtEntry:    *stopAtEntry,
+		}
+	} else {
+		config = proto.DaemonConfig{
+			Mode:           "project",
+			SessionID:      *session,
+			NetcoredbgPath: dbgPath,
+			Project:        targetPath,
+			LaunchProfile:  *launchProfile,
+			Args:           pArgs,
+			Cwd:            *cwd,
+			Env:            map[string]string(envVars),
+		}
 	}
 
 	startDaemonProcess(config)
 
-	sf, err := waitForSession(*session, 30*time.Second)
+	sf, err := waitForSession(*session, 45*time.Second) // project mode needs more time
 	if err != nil {
-		// Try to show daemon log for diagnostics
 		logPath := paths.LogFile(*session)
 		if logData, e := os.ReadFile(logPath); e == nil && len(logData) > 0 {
 			fmt.Fprintf(os.Stderr, "--- daemon log ---\n%s\n", string(logData))
@@ -190,6 +266,13 @@ func cmdAttach(args []string) {
 
 	if *session == "" {
 		*session = fmt.Sprintf("pid-%d", *pid)
+	}
+	if sf, err := loadSession(*session); err == nil {
+		if isProcessAlive(sf.DaemonPID) {
+			fatal("session %q already exists and is running (PID %d). Use 'stop --session %s' first.", *session, sf.DaemonPID, *session)
+		}
+		os.Remove(paths.SessionFile(*session))
+		log.Printf("cleaned up stale session %q (PID %d no longer running)", *session, sf.DaemonPID)
 	}
 
 	dbgPath := *netcoredbg
@@ -281,10 +364,13 @@ func cmdContinue(args []string) {
 	noWait := fs.Bool("no-wait", false, "don't wait for stop")
 	timeout := fs.Duration("timeout", 30*time.Second, "wait timeout")
 	session := fs.String("session", "", "session ID")
+	healthURL := fs.String("health-url", "", "URL to poll for 200 OK after continue")
+	healthTimeout := fs.Duration("health-timeout", 30*time.Second, "health check timeout")
 	fs.Parse(args)
 
 	waitFlag := 1
-	if *noWait {
+	if *noWait || *healthURL != "" {
+		// Health polling requires --no-wait semantics (can't wait for breakpoint and poll simultaneously)
 		waitFlag = 0
 	}
 
@@ -294,6 +380,17 @@ func cmdContinue(args []string) {
 		TimeoutMs:   int(timeout.Milliseconds()),
 	})
 	printResult(result)
+
+	if *healthURL != "" && result.OK {
+		if err := pollHealth(*healthURL, *healthTimeout); err != nil {
+			printResult(proto.Result{Error: fmt.Sprintf("health check failed: %v", err)})
+		} else {
+			printResult(proto.Result{OK: true, Data: map[string]interface{}{
+				"health": "ok",
+				"url":    *healthURL,
+			}})
+		}
+	}
 }
 
 func cmdStep(kind string, args []string) {
@@ -822,11 +919,67 @@ func parseIntList(s string) []int {
 	return nums
 }
 
+// pollHealth polls a URL until it returns HTTP 200 or the timeout expires.
+func pollHealth(url string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 5 * time.Second}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("health endpoint %s did not return 200 within %v", url, timeout)
+}
+
+// parsePortsFromURLs extracts port numbers from a semicolon-separated URL list
+// like "http://localhost:5057;https://localhost:5058".
+func parsePortsFromURLs(urls string) []int {
+	var ports []int
+	for _, u := range strings.Split(urls, ";") {
+		u = strings.TrimSpace(u)
+		if idx := strings.LastIndex(u, ":"); idx >= 0 {
+			portStr := strings.TrimRight(u[idx+1:], "/")
+			var p int
+			if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil && p > 0 {
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports
+}
+
+// checkPortAvailable checks if a TCP port is free. Returns (true, 0) if available,
+// or (false, pid) if in use (pid is best-effort, may be 0).
+func checkPortAvailable(port int) (bool, int) {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err == nil {
+		ln.Close()
+		return true, 0
+	}
+	// Best-effort: find PID using the port (macOS/Linux only)
+	out, err := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-t").Output()
+	if err == nil {
+		pidStr := strings.TrimSpace(strings.Split(string(out), "\n")[0])
+		var pid int
+		if _, err := fmt.Sscanf(pidStr, "%d", &pid); err == nil {
+			return false, pid
+		}
+	}
+	return false, 0
+}
+
 func printUsage() {
 	fmt.Fprintln(os.Stderr, `dotnet-debug — autonomous .NET debugger for AI agents
 
 Session management:
-  launch    --dll <path> [--cwd <dir>] [--args "..."] [--session <id>] [--stop-at-entry]
+  launch    --dll <path> [--env K=V ...] [--cwd <dir>] [--args "..."] [--session <id>]
+            [--stop-at-entry] [--force]
+  launch    --project <csproj> [--launch-profile <name>] [--env K=V ...] [--session <id>]
   attach    --pid <pid> [--session <id>]
   sessions  List active debug sessions
   stop      [--session <id>] [--all]    Stop a debug session
@@ -837,7 +990,7 @@ Breakpoints:
   exception-bp [--filters all|user-unhandled]
 
 Execution:
-  continue, c   [--no-wait] [--timeout <dur>]    Resume execution
+  continue, c   [--no-wait] [--timeout <dur>] [--health-url <url>] [--health-timeout <dur>]
   next, n       [--timeout <dur>]                 Step over
   step-in, si   [--timeout <dur>]                 Step into
   step-out, so  [--timeout <dur>]                 Step out
